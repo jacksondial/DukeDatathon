@@ -1,0 +1,683 @@
+---
+title: "EDA"
+author: "Jackson Dial"
+date: "11/6/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(foreign)
+library(tidyverse)
+library(inspectdf)
+library(tictoc)
+library(xgboost)
+library(caret)
+library(randomForest)
+require(caTools)
+```
+
+# Read in Data
+
+```{r}
+data <- read.spss("../dataset2021/data/data/W1 Merged Data/Wave.1_Data/Thailand/thailand v4.2.sav", to.data.frame=TRUE)
+attach(data)
+data %>%
+inspect_types()
+
+```
+
+## Merge Country Data
+
+```{r}
+countries <- c("Hong Kong", "Japan", "Korea", "Mainland China", "Mongolia",
+               "Philippines", "Taiwan", "Thailand")
+tolower(countries)
+allData <- data.frame()
+for (i in 1:length(countries)) {
+  if (countries[i] == "Mainland China") {
+    data <- read.spss(paste0("../dataset2021/data/data/W1 Merged Data/Wave.1_Data/",countries[i], "/mainland v4.2.sav"), 
+                      to.data.frame=TRUE)
+    data$newCountry <- "China"
+    allData <- merge(allData, data, all = TRUE)
+  } else {
+    data <- read.spss(paste0("../dataset2021/data/data/W1 Merged Data/Wave.1_Data/",countries[i], "/",tolower(countries[i])," v4.2.sav"), 
+                      to.data.frame=TRUE)
+    data$newCountry <- countries[i]
+    allData <- merge(allData, data, all = TRUE)
+  }
+}
+
+for (i in 1:nrow(allData)) {
+  if (is.na(allData$se004[i]) == TRUE) {
+    if (is.na(allData$se004a[i]) == TRUE) {
+      allData$se004[i] <- NA
+    } else if(allData$se004a[i] == "No") {
+      allData$se004[i] <- "Single"
+    } else if (allData$se004a[i] == "Yes") {
+      allData$se004[i] <- "Married"
+    }
+  }
+}
+
+```
+
+# Select just variables of interest
+
+```{r}
+priority <- read.csv("PriorityVars.csv", header = TRUE, skip = 1)
+
+#varsofinterest <- prioritydf$ABSWave1...4
+
+#library(stringr)
+#dfOfInterest <- allData %>%
+#     select(matches(str_c(varsofinterest, collapse = "|")))
+
+```
+
+
+```{r include = FALSE}
+dfOfInterest %>% inspect_types()
+
+sum(is.na(dfOfInterest$q008))
+
+#country variable is good
+levels(dfOfInterest$country)
+
+#sex is good
+levels(dfOfInterest$se002)
+
+#I think age is supposed to be only 18 or older
+summary(as.numeric(as.character(dfOfInterest$se003a)))
+
+
+
+## 
+
+q8levels <- tolower(levels(dfOfInterest$q008))
+q8levels
+
+none <- grep("none", q8levels)
+none1 <- q8levels[none]
+
+great <- grep("great", q8levels)
+great1 <- q8levels[great]
+
+quite <- grep("quite", q8levels)
+quite1 <- q8levels[quite]
+
+notvery <- dput(grep("not very", q8levels))
+notvery1 <- q8levels[notvery]
+
+library(textclean)
+
+paste(shQuote(notvery1), collapse=", ")
+
+df2 <- dfOfInterest %>% 
+  mutate(Government = as.factor(case_when(
+    q008 %in% none1 ~ "None at all",
+    q008 %in% great1 ~ "A great deal of trust",
+    q008 %in% quite1 ~ "Quite a lot of trust",
+    q008 %in% notvery ~ "Not very much trust"
+  ))) #%>% 
+  select(Government)
+sum(is.na(df2))
+
+
+trashdf <- df2 %>% select(q008, Government)
+```
+
+## For Loops
+
+```{r}
+
+naVals <- NULL
+for (i in 1:ncol(allData)) {
+  naVals[i] <- sum(is.na(allData[,i]))
+}
+
+##### Read in priority table ######
+priority <- read.csv("D2-ABS1+2.csv", header = TRUE, skip = 1)
+priority$ABS1_Coding_name[16] <- "q029" # question was mislabeled as q028 but should be q029
+
+priorityTable <- data.frame(nrow = 11406)
+for (i in 1:21) {
+  a <- data.frame(allData[,priority[i,4]])
+  priorityTable <- cbind(priorityTable, a)
+}
+priorityTable <- priorityTable[,2:22]
+colnames(priorityTable) <- priority$ABS1_Coding_name[1:21]
+priorityTable$newCountry <- allData$newCountry
+
+# grab all levels of priorities
+allLevels <- list()
+for (i in 1:21) {
+  allLevels[[i]] <- unique(trimws(toupper(levels(priorityTable[,i]))))
+}
+
+cleanData <- priorityTable
+
+marital <- allLevels[[2]]
+education <- allLevels[[3]]
+q8terms <- allLevels[[8]]
+q98terms <- allLevels[[12]]
+q128terms <- allLevels[[13]]
+q106terms <- allLevels[[18]]
+q127terms <- allLevels[[21]]
+tic()
+for (i in 1:nrow(cleanData)) {
+  if (is.na(cleanData$se002[i]) == TRUE) {
+    cleanData$newGender[i] <- NA
+  } else {
+    cleanData$newGender[i] <- trimws(toupper(as.character(cleanData$se002[i])))
+  }
+  
+  status <- trimws(toupper(as.character(cleanData$se004[i])))
+  maritalIndex <- c(1,2,3,4,5,6,6,2,4,5,6,2,4,4,3,4,6,4)
+  maritalName <- c("MARRIED", "LIVING-IN AS MARRIED", "WIDOWED",
+                  "SEPARATED", "DIVORCED", "SINGLE")
+  if (is.na(status) == TRUE) {
+    cleanData$newMarital[i] <- NA
+  } else {
+    cleanData$newMarital[i] <- maritalName[maritalIndex[which(marital == status)]]
+  }
+  
+  educ <- trimws(toupper(as.character(cleanData$se005[i])))
+  educIndex <- c(2,3,6,7,6,7,8,9,10,1,2,3,2,3,6,7,8,9,10,1,2,3,6,7,6,7,8,9,10,
+                 11,2,3,4,5,6,7,8,9,10,11,5,5,6,9,9)
+  educName <- c("NONE", "INCOMPLETE PRIMARY", "COMPLETE PRIMARY",
+                "INCOMPLETE TECHNICAL", "COMPLETE TECHNICAL",
+                "INCOMPLETE SECONDARY", "COMPLETE SECONDARY",
+                "SOME UNIVERSITY", "UNIVERSITY DEGREE", "POST-GRADUATE",
+                NA)
+  if (is.na(educ) == TRUE) {
+    cleanData$newEducation[i] <- NA
+  } else {
+    cleanData$newEducation[i] <- educName[educIndex[which(education == educ)]]
+  }
+  
+  cleanData$newAge[i] <- as.numeric(as.character(cleanData$se003a[i]))
+  
+  q8 <- trimws(toupper(as.character(cleanData$q008[i])))
+  q8Index <- c(1,2,3,4,2,3,4,5)
+  q8Name <- c("NONE AT ALL", "NOT VERY MUCH TRUST", 
+              "QUITE A LOT OF TRUST", "A GREAT DEAL OF TRUST",
+              "NOT SURE")
+  if (is.na(q8) == TRUE) {
+    cleanData$newQ8[i] <- NA
+  } else {
+    cleanData$newQ8[i] <- q8Name[q8Index[which(q8terms == q8)]]
+  }
+  
+  q98 <- trimws(toupper(as.character(cleanData$q098[i])))
+  q98Index <- c(1,2,3,4,1,2,3,1,2,3)
+  q98Name <- c("NOT AT ALL SATISFIED", "NOT VERY SATISFIED",
+               "FAIRLY SATISFIED", "VERY SATISFIED")
+  if (is.na(q98) == TRUE) {
+    cleanData$newQ98[i] <- NA
+  } else {
+    cleanData$newQ98[i] <- q98Name[q98Index[which(q98terms == q98)]]
+  }
+  
+  q128 <- trimws(toupper(as.character(cleanData$q128[i])))
+  q128Index <- c(1,2,3,4,1,2,3,4)
+  q128Name <- c("STRONGLY AGREE", "SOMEWHAT AGREE",
+               "SOMEWHAT DISAGREE", "STRONGLY DISAGREE")
+  if (is.na(q128) == TRUE) {
+    cleanData$newQ128[i] <- NA
+  } else {
+    cleanData$newQ128[i] <- q128Name[q128Index[which(q128terms == q128)]]
+  }
+  
+  q27 <- trimws(toupper(as.character(cleanData$q027[i])))
+  if (is.na(q27) == TRUE) {
+    cleanData$newQ27[i] <- NA
+  } else {
+    cleanData$newQ27[i] <- q27
+  }
+  
+  q29 <- trimws(toupper(as.character(cleanData$q029[i])))
+  if (is.na(q29) == TRUE) {
+    cleanData$newQ29[i] <- NA
+  } else {
+    cleanData$newQ29[i] <- q29
+  }
+  
+  q106 <- trimws(toupper(as.character(cleanData$q106[i])))
+  q106Index <- c(1,2,3,4,5,3,5,5,1,2,4,1)
+  q106Name <- c("MUCH WORSE", "SOMEWHAT WORSE", "ABOUT THE SAME",
+                "SOMEWHAT BETTER", "MUCH BETTER")
+  if (is.na(q106) == TRUE) {
+    cleanData$newQ106[i] <- NA
+  } else {
+    cleanData$newQ106[i] <- q106Name[q106Index[which(q106terms == q106)]]
+  }
+  
+  q127 <- trimws(toupper(as.character(cleanData$q127[i])))
+  q127Index <- c(1,2,3,4,1,2,3,4)
+  q127Name <- c("STRONGLY AGREE", "SOMEWHAT AGREE",
+                "SOMEWHAT DISAGREE", "STRONGLY DISAGREE")
+  if (is.na(q127) == TRUE) {
+    cleanData$newQ127[i] <- NA
+  } else {
+    cleanData$newQ127[i] <- q127Name[q127Index[which(q127terms == q127)]]
+  }
+}
+toc()
+```
+
+
+```{r}
+modeldata <- cleanData %>% 
+  select(newGender, newEducation, newAge, newCountry, newQ8)
+modeldata$newGender <- as.factor(modeldata$newGender)
+#modeldata$newMarital <- as.factor(modeldata$newMarital)
+modeldata$newEducation <- as.factor(modeldata$newEducation)
+modeldata$newCountry <- as.factor(modeldata$newCountry)
+modeldata$newQ8 <- as.factor(modeldata$newQ8)
+```
+
+# Model
+
+```{r}
+sapply(modeldata, class)
+summary(modeldata)
+```
+
+```{r}
+colSums(is.na(modeldata))
+#drop NA values in dependent variable
+nrow(modeldata) - sum(is.na(modeldata$newQ8))
+modeldata2 <- modeldata %>% drop_na(newQ8)
+nrow(modeldata2) #should match the code two lines above and it does; 10773
+```
+
+```{r}
+smp_size <- floor(0.75 * nrow(modeldata2))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(modeldata2)), size = smp_size)
+
+train <- modeldata2[train_ind, ]
+test <- modeldata2[-train_ind, ]
+colSums(is.na(train))
+colSums(is.na(test))
+
+#verify there were no missed/double-counted values
+nrow(modeldata2) - (nrow(train) + nrow(test))
+```
+
+### Random Forest
+
+```{r}
+tic()
+rf <- randomForest(
+  newQ8 ~ .,
+  data = train,
+  na.action = na.omit
+)
+toc()
+rf$confusion
+rf$err.rate
+rf$importance
+
+```
+
+
+### Second RF
+
+```{r}
+rf2 <- train(
+  newQ8 ~ .,
+  data = train,
+  method = "rf",
+  trControl = trainControl(method = 'cv', number = 5), #uses cross-validation
+  na.action = na.omit
+)
+rf2$bestTune
+rf2$results
+```
+
+#### Test
+
+```{r}
+predicted.classes <- rf2 %>% predict(test)
+head(predicted.classes)
+
+mean(predicted.classes == test$newQ8)
+
+```
+
+
+#### Partition by country
+
+```{r}
+thailand <- modeldata2 %>% filter(newCountry == "Thailand")
+smp_size <- floor(0.75 * nrow(thailand))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(thailand)), size = smp_size)
+
+trainth <- thailand[train_ind, ]
+testth <- thailand[-train_ind, ]
+colSums(is.na(trainth))
+colSums(is.na(testth))
+
+  
+```
+
+
+```{r}
+tic()
+rf <- train(
+  newQ8 ~ .,
+  data = trainth,
+  na.action = na.omit
+)
+toc()
+rf$bestTune
+rf$results #0.514 accuracy, kappa of 0
+```
+
+```{r}
+#look at frequency of two levels in the thailand df
+thailand %>% filter(newQ8 == "A GREAT DEAL OF TRUST") %>% nrow()
+thailand %>% filter(newQ8 == "NONE AT ALL") %>% nrow()
+
+
+```
+
+
+
+```{r}
+japan <- modeldata2 %>% filter(newCountry == "Japan")
+smp_size <- floor(0.75 * nrow(japan))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(japan)), size = smp_size)
+
+trainja <- japan[train_ind, ]
+testja <- japan[-train_ind, ]
+colSums(is.na(trainja))
+colSums(is.na(testja))
+
+  
+```
+
+
+```{r}
+tic()
+rfja <- train(
+  newQ8 ~ .,
+  data = trainja,
+  na.action = na.omit
+)
+toc()
+rfja$bestTune
+rfja$results #0.63 accuracy
+```
+
+
+
+```{r}
+korea <- modeldata2 %>% filter(newCountry == "Korea")
+smp_size <- floor(0.75 * nrow(korea))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(korea)), size = smp_size)
+
+trainko <- korea[train_ind, ]
+testko <- korea[-train_ind, ]
+colSums(is.na(trainko))
+colSums(is.na(testko))
+
+  
+```
+
+
+```{r}
+tic()
+rfko <- train(
+  newQ8 ~ .,
+  data = trainko,
+  na.action = na.omit
+)
+toc()
+rfko$bestTune
+rfko$results #0.52 accuracy
+```
+
+
+
+```{r}
+taiwan <- modeldata2 %>% filter(newCountry == "Taiwan")
+smp_size <- floor(0.75 * nrow(taiwan))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(taiwan)), size = smp_size)
+
+trainta <- taiwan[train_ind, ]
+testta <- taiwan[-train_ind, ]
+colSums(is.na(trainta))
+colSums(is.na(testta))
+
+  
+```
+
+
+```{r}
+tic()
+rfta <- train(
+  newQ8 ~ .,
+  data = trainta,
+  na.action = na.omit
+)
+toc()
+rfta$bestTune
+rfta$results #0.47 accuracy
+```
+
+
+
+```{r}
+china <- modeldata2 %>% filter(newCountry == "China")
+smp_size <- floor(0.75 * nrow(china))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(china)), size = smp_size)
+
+train <- china[train_ind, ]
+test <- china[-train_ind, ]
+colSums(is.na(train))
+colSums(is.na(test))
+
+  
+```
+
+
+```{r}
+tic()
+rf <- train(
+  newQ8 ~ .,
+  data = train,
+  na.action = na.omit
+)
+toc()
+rf$bestTune
+rf$results #0.924 accuracy
+```
+
+
+
+
+```{r}
+mongolia <- modeldata2 %>% filter(newCountry == "Mongolia")
+smp_size <- floor(0.75 * nrow(mongolia))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(mongolia)), size = smp_size)
+
+trainmo <- mongolia[train_ind, ]
+testmo <- mongolia[-train_ind, ]
+colSums(is.na(train))
+colSums(is.na(test))
+
+  
+```
+
+
+```{r}
+tic()
+rfmo <- train(
+  newQ8 ~ .,
+  data = trainmo,
+  na.action = na.omit
+)
+toc()
+rfmo$bestTune
+rfmo$results #Error that I don't have time to investigate
+```
+
+
+
+```{r}
+phillipines <- modeldata2 %>% filter(newCountry == "Philippines")
+smp_size <- floor(0.75 * nrow(phillipines))
+## set the seed for reproducibility
+set.seed(19)
+train_ind <- sample(seq_len(nrow(phillipines)), size = smp_size)
+
+train <- phillipines[train_ind, ]
+test <- phillipines[-train_ind, ]
+colSums(is.na(train))
+colSums(is.na(test))
+
+  
+```
+
+
+```{r}
+tic()
+rf <- train(
+  newQ8 ~ .,
+  data = train,
+  na.action = na.omit
+)
+toc()
+rf$bestTune
+rf$results #0.41 accuracy
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+predicted.classes <- rf %>% predict(test)
+head(predicted.classes)
+
+mean(predicted.classes == testth$newQ8)
+```
+
+
+```{r}
+tic()
+rf2 <- train(
+  newQ8 ~ .,
+  data = trainth,
+  method = "rf",
+  trControl = trainControl(method = 'cv', number = 5), #uses cross-validation
+  na.action = na.omit
+)
+toc()
+rf2$bestTune
+rf2$results
+
+#best accuracy for thailand is 0.5102240
+```
+
+
+
+
+
+
+
+
+
+### XGBoost
+
+```{r}
+tic()
+model <- train(
+  newQ8 ~., data = train, method = "xgbTree",
+  na.action = na.omit,
+  
+  )
+toc()
+# Best tuning parameter
+model$bestTune
+model$results
+
+```
+
+#### Test
+
+```{r}
+predicted.classes <- model %>% predict(test)
+head(predicted.classes)
+
+mean(predicted.classes == test$newQ8)
+
+```
+
+
+
+
+
+### KNN
+
+```{r}
+##extract 5th column of train dataset because it will be used as 'cl' argument in knn function.
+ trainTarget <- train[6]
+ ##extract 5th column if test dataset to measure the accuracy
+ testTarget <- test[6]
+##load the package class
+ library(class)
+ ##run knn function
+ pr <- knn(train,test,cl=trainTarget,k=13)
+ 
+ ##create confusion matrix
+ tab <- table(pr,iris_test_category)
+ 
+ ##this function divides the correct predictions by total number of predictions that tell us how accurate teh model is.
+ 
+ accuracy <- function(x){sum(diag(x)/(sum(rowSums(x)))) * 100}
+ accuracy(tab)
+
+```
